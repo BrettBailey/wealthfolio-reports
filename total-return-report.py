@@ -507,6 +507,44 @@ def _nav_html(labels: list[str], current: str, today: date) -> str:
     return f"<nav class='report-nav'>{''.join(links)}</nav>"
 
 
+# ---------- standard/quarterly view toggle ----------
+# Every period row is tagged view-standard, view-quarterly, or view-both (rows shared
+# by both views, e.g. current quarter, prior years, since-inception). The body's
+# data-view attribute controls which of view-standard/view-quarterly is hidden;
+# view-both rows are always shown.
+
+VIEW_TOGGLE_HTML = "<p class='view-toggle'><a href='#' class='view-toggle-link'>show quarterly view &gt;</a></p>"
+
+VIEW_TOGGLE_CSS = """
+p.view-toggle { margin: 4px 0 16px; }
+p.view-toggle a { font-size: 0.9em; color: #559; text-decoration: none; }
+p.view-toggle a:hover { text-decoration: underline; }
+body[data-view='standard'] tr.view-quarterly { display: none; }
+body[data-view='quarterly'] tr.view-standard { display: none; }
+"""
+
+VIEW_TOGGLE_JS = """
+(function() {
+  var STORAGE_KEY = 'wealthfolioReportView';
+  function setView(view, link) {
+    document.body.dataset.view = view;
+    link.textContent = view === 'quarterly' ? 'show standard view >' : 'show quarterly view >';
+  }
+  var savedView;
+  try { savedView = localStorage.getItem(STORAGE_KEY); } catch (e) { savedView = null; }
+  document.querySelectorAll('a.view-toggle-link').forEach(function(link) {
+    if (savedView === 'quarterly') setView('quarterly', link);
+    link.addEventListener('click', function(e) {
+      e.preventDefault();
+      var view = document.body.dataset.view === 'quarterly' ? 'standard' : 'quarterly';
+      setView(view, link);
+      try { localStorage.setItem(STORAGE_KEY, view); } catch (e) {}
+    });
+  });
+})();
+"""
+
+
 def _fmt_money_html(value) -> str:
     if value is None or (isinstance(value, Decimal) and value.is_nan()):
         return "&nbsp;"
@@ -646,7 +684,8 @@ def _period_table_html(title: str | None, rows: list[dict], show_div_col: bool, 
             ]
             if show_yield_col:
                 cells.append(f"<td class='num'>{_fmt_pct_html(row['yield_pct']) if row.get('show_yield') else '&nbsp;'}</td>")
-        body.append("<tr>" + "".join(cells) + "</tr>")
+        row_class = f" class='view-{row.get('view', 'both')}'"
+        body.append(f"<tr{row_class}>" + "".join(cells) + "</tr>")
     heading = f"<h3>{html.escape(title)}</h3>" if title else ""
     footnote = (
         f"<p class='price-gap-note'>* excludes {html.escape(', '.join(missing_tickers_seen))} "
@@ -754,7 +793,7 @@ def _stock_summary_row_html(simple_pct: Decimal | None, twr_pct: Decimal | None,
     return "<p class='stock-summary'>" + " &nbsp;|&nbsp; ".join(parts) + "</p>"
 
 
-def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods, today: date,
+def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods, period_views: dict, today: date,
                           weight_pct: Decimal | None = None) -> str:
     """Build the aggregate 'portfolio total' block (heading + summary + period table)
     for a set of stocks. Used for a single account's total, the cross-account
@@ -767,18 +806,22 @@ def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods,
     prior_years_portfolio = _prior_year_periods(earliest_activity, today)
     portfolio_periods = common_periods + prior_years_portfolio + [("Since inception", earliest_activity, today)]
     portfolio_rows = [_period_row_data(all_stocks, period) for period in portfolio_periods]
+    num_common_periods = len(common_periods)
+    for row in portfolio_rows[:num_common_periods]:
+        row["view"] = period_views.get(row["label"], "both")
+    for row in portfolio_rows[num_common_periods:]:  # prior years + since-inception: standard view only
+        row["view"] = "standard"
 
     # mark partial years (window doesn't start Jan 1)
-    num_common_periods = len(common_periods)
     num_prior_years = len(prior_years_portfolio)
     for row, (_, period_start, _) in zip(portfolio_rows[num_common_periods:num_common_periods + num_prior_years], prior_years_portfolio):
         if period_start != date(period_start.year, 1, 1):
             row["partial"] = True
 
     # show yield column on YTD and each prior year; NOT on "Since inception" (not meaningful)
-    ytd_index = num_common_periods - 1  # YTD is last of common_periods
-    for row in portfolio_rows[ytd_index:ytd_index + 1]:
-        row["show_yield"] = True
+    for row in portfolio_rows[:num_common_periods]:
+        if row["label"] == "Year to date":
+            row["show_yield"] = True
     for row in portfolio_rows[num_common_periods:num_common_periods + num_prior_years]:  # prior years only, not since-inception
         row["show_yield"] = True
 
@@ -809,24 +852,28 @@ def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods,
     )
 
 
-def _stock_block_html(stock: Stock, activities_div_id: str, common_periods, today: date,
+def _stock_block_html(stock: Stock, activities_div_id: str, common_periods, period_views: dict, today: date,
                       weight_pct: Decimal | None, closed_on: date | None) -> str:
     """Build one <section class='stock'> block: heading, summary row, period table, activities toggle."""
     num_common_periods = len(common_periods)
-    ytd_index = num_common_periods - 1  # YTD is last of common_periods
 
     inception = min((a.activity_date for a in stock.activities if a.kind in ("BUY", "SELL")), default=today)
     prior_years = _prior_year_periods(inception, today)
     stock_periods = common_periods + prior_years + [("Since inception", inception, today)]
     rows = [_period_row_data(stock, period) for period in stock_periods]
+    for row in rows[:num_common_periods]:
+        row["view"] = period_views.get(row["label"], "both")
+    for row in rows[num_common_periods:]:  # prior years + since-inception: standard view only
+        row["view"] = "standard"
     num_prior_years_stock = len(prior_years)
     for row, (_, period_start, _) in zip(rows[num_common_periods:num_common_periods + num_prior_years_stock], prior_years):
         if period_start != date(period_start.year, 1, 1):
             row["partial"] = True
 
     # show yield on YTD and prior years; NOT on "Since inception" (misleading against initial cost)
-    for row in rows[ytd_index:ytd_index + 1]:
-        row["show_yield"] = True
+    for row in rows[:num_common_periods]:
+        if row["label"] == "Year to date":
+            row["show_yield"] = True
     for row in rows[num_common_periods:num_common_periods + num_prior_years_stock]:  # prior years only, not since-inception
         row["show_yield"] = True
 
@@ -864,7 +911,7 @@ def _stock_block_html(stock: Stock, activities_div_id: str, common_periods, toda
     )
 
 
-def _theme_blocks_html(account: str, all_stocks: list[Stock], common_periods, today: date,
+def _theme_blocks_html(account: str, all_stocks: list[Stock], common_periods, period_views: dict, today: date,
                        current_market_value, portfolio_total_market_value: Decimal) -> str:
     """Build one block per theme configured for this account (THEMES in config.py),
     each an aggregate return block (like the account total) for its member tickers,
@@ -887,7 +934,7 @@ def _theme_blocks_html(account: str, all_stocks: list[Stock], common_periods, to
         weight_pct = (theme_market_value / portfolio_total_market_value * 100
                       if portfolio_total_market_value > 0 else None)
         theme_html = _portfolio_block_html(
-            f"{theme_name} Theme", theme_stocks, common_periods, today, weight_pct=weight_pct,
+            f"{theme_name} Theme", theme_stocks, common_periods, period_views, today, weight_pct=weight_pct,
         )
         blocks.append(f"<section class='theme'>{theme_html}</section>")
     return "".join(blocks)
@@ -895,8 +942,8 @@ def _theme_blocks_html(account: str, all_stocks: list[Stock], common_periods, to
 
 def build_account_html(account: str, held_stocks: list[Stock],
                        all_stocks: list[Stock],
-                       common_periods, today: date, nav_html: str = "") -> str:
-    portfolio_html = _portfolio_block_html(f"{account} Account Total", all_stocks, common_periods, today)
+                       common_periods, period_views: dict, today: date, nav_html: str = "") -> str:
+    portfolio_html = _portfolio_block_html(f"{account} Account Total", all_stocks, common_periods, period_views, today)
 
     # per-stock blocks — currently held, sorted by current market value descending
     def _current_market_value(stock: Stock) -> Decimal:
@@ -907,7 +954,7 @@ def build_account_html(account: str, held_stocks: list[Stock],
     held_stocks_sorted = sorted(held_stocks, key=_current_market_value, reverse=True)
 
     theme_blocks_html = _theme_blocks_html(
-        account, all_stocks, common_periods, today, _current_market_value, portfolio_total_market_value,
+        account, all_stocks, common_periods, period_views, today, _current_market_value, portfolio_total_market_value,
     )
 
     stock_blocks = []
@@ -916,7 +963,7 @@ def build_account_html(account: str, held_stocks: list[Stock],
         weight_pct = (stock_market_value / portfolio_total_market_value * 100
                       if portfolio_total_market_value > 0 else None)
         stock_blocks.append(_stock_block_html(
-            stock, f"acts-{stock_index}", common_periods, today, weight_pct, closed_on=None,
+            stock, f"acts-{stock_index}", common_periods, period_views, today, weight_pct, closed_on=None,
         ))
 
     # recently-closed positions: sold out entirely, but within RECENTLY_CLOSED_DAYS of today
@@ -933,7 +980,7 @@ def build_account_html(account: str, held_stocks: list[Stock],
         closed_blocks.append("<h3 class='closed-heading'>Recently closed</h3>")
         for stock_index, (stock, closed_on) in enumerate(recently_closed):
             closed_blocks.append(_stock_block_html(
-                stock, f"acts-closed-{stock_index}", common_periods, today, weight_pct=None, closed_on=closed_on,
+                stock, f"acts-closed-{stock_index}", common_periods, period_views, today, weight_pct=None, closed_on=closed_on,
             ))
 
     css = """
@@ -961,7 +1008,7 @@ def build_account_html(account: str, held_stocks: list[Stock],
     h3.closed-heading { margin-top: 32px; border-bottom: 2px solid #444; padding-bottom: 4px; }
     span.closed-note { font-size: 0.7em; font-weight: normal; color: #888; }
     p.price-gap-note { margin: -12px 0 20px; font-size: 0.82em; color: #888; }
-    """ + NAV_CSS
+    """ + NAV_CSS + VIEW_TOGGLE_CSS
     js = """
     document.querySelectorAll('a.toggle').forEach(function(link) {
       link.addEventListener('click', function(e) {
@@ -972,14 +1019,15 @@ def build_account_html(account: str, held_stocks: list[Stock],
         this.textContent = visible ? 'show activities >' : 'hide activities <';
       });
     });
-    """
+    """ + VIEW_TOGGLE_JS
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'>
 <title>{html.escape(account)}</title>
 <style>{css}</style>
-</head><body>
+</head><body data-view='standard'>
 <h1>{html.escape(account)} Return Report Generated {today.isoformat()}</h1>
 {nav_html}
+{VIEW_TOGGLE_HTML}
 <section class='portfolio'>{portfolio_html}</section>
 {theme_blocks_html}
 {''.join(stock_blocks)}
@@ -988,10 +1036,10 @@ def build_account_html(account: str, held_stocks: list[Stock],
 </body></html>"""
 
 
-def build_overview_html(all_stocks: list[Stock], common_periods, today: date, nav_html: str) -> str:
+def build_overview_html(all_stocks: list[Stock], common_periods, period_views: dict, today: date, nav_html: str) -> str:
     """Whole-portfolio view combining stocks from every account, using the same
     timebands/columns as an account's portfolio-total block."""
-    portfolio_html = _portfolio_block_html("Portfolio Total", all_stocks, common_periods, today)
+    portfolio_html = _portfolio_block_html("Portfolio Total", all_stocks, common_periods, period_views, today)
 
     css = """
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #222; }
@@ -1010,15 +1058,17 @@ def build_overview_html(all_stocks: list[Stock], common_periods, today: date, na
     .no-price { color: #888; font-style: italic; text-align: center !important; }
     p.stock-summary { margin: 2px 0 0; font-size: 0.88em; color: #555; padding-bottom: 6px; border-bottom: 2px solid #444; }
     p.price-gap-note { margin: -12px 0 20px; font-size: 0.82em; color: #888; }
-    """ + NAV_CSS
+    """ + NAV_CSS + VIEW_TOGGLE_CSS
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'>
 <title>{html.escape(OVERVIEW_LABEL)}</title>
 <style>{css}</style>
-</head><body>
+</head><body data-view='standard'>
 <h1>{html.escape(OVERVIEW_LABEL)} Return Report Generated {today.isoformat()}</h1>
 {nav_html}
+{VIEW_TOGGLE_HTML}
 <section class='portfolio'>{portfolio_html}</section>
+<script>{VIEW_TOGGLE_JS}</script>
 </body></html>"""
 
 
@@ -1040,12 +1090,38 @@ def main():
     prev_q2_start, prev_q2_end = prev_quarter(prev_q1_start)
     ytd_start, ytd_end = date(TODAY.year, 1, 1), TODAY
 
-    common_periods = [
+    standard_periods = [
         ("Current month",            TODAY.replace(day=1),    TODAY),
         ("Current quarter",          current_quarter_start,   current_quarter_end),
         (_quarter_label(prev_q1_start), prev_q1_start,        prev_q1_end),
         (_quarter_label(prev_q2_start), prev_q2_start,        prev_q2_end),
         ("Year to date",             ytd_start,               ytd_end),
+    ]
+
+    # Quarterly view: current quarter plus the prior 4, and the span since the
+    # start of the earliest quarter shown (quarter-aligned, not a rolling 12 months).
+    quarter_starts = [current_quarter_start]
+    for _ in range(4):
+        prev_start, _ = prev_quarter(quarter_starts[-1])
+        quarter_starts.append(prev_start)
+    earliest_quarter_start = quarter_starts[-1]
+
+    quarterly_periods = [("Current quarter", current_quarter_start, current_quarter_end)]
+    for quarter_start in quarter_starts[1:]:
+        quarter_start_bound, quarter_end_bound = quarter_bounds(quarter_start)
+        quarterly_periods.append((_quarter_label(quarter_start_bound), quarter_start_bound, quarter_end_bound))
+    quarterly_periods.append((f"Since {earliest_quarter_start}", earliest_quarter_start, TODAY))
+
+    # "Current quarter" is shown in both views; every other quarter/label is
+    # exclusive to whichever view it belongs to (even if the date range overlaps,
+    # e.g. the two most recent prior quarters appear in both period lists but
+    # should only be visible in the quarterly view).
+    period_views = {label: "standard" for label, _, _ in standard_periods}
+    for label, _, _ in quarterly_periods:
+        period_views[label] = "both" if label == "Current quarter" else "quarterly"
+
+    common_periods = standard_periods + [
+        period for period in quarterly_periods if period[0] not in {p[0] for p in standard_periods}
     ]
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1068,7 +1144,7 @@ def main():
     overview_all_stocks = [stock for _, _, all_stocks in loaded_accounts for stock in all_stocks]
     if overview_all_stocks:
         overview_nav_html = _nav_html(nav_labels, OVERVIEW_LABEL, TODAY)
-        overview_doc = build_overview_html(overview_all_stocks, common_periods, TODAY, overview_nav_html)
+        overview_doc = build_overview_html(overview_all_stocks, common_periods, period_views, TODAY, overview_nav_html)
         overview_filepath = os.path.join(OUTPUT_DIR, _report_filename(OVERVIEW_LABEL, TODAY))
         with open(overview_filepath, "w", encoding="utf-8") as f:
             f.write(overview_doc)
@@ -1077,7 +1153,7 @@ def main():
     # Pass 3: write each account page with nav links to the overview + every other account.
     for account, held_stocks, all_stocks in loaded_accounts:
         nav_html = _nav_html(nav_labels, account, TODAY)
-        html_doc = build_account_html(account, held_stocks, all_stocks, common_periods, TODAY, nav_html)
+        html_doc = build_account_html(account, held_stocks, all_stocks, common_periods, period_views, TODAY, nav_html)
         filepath = os.path.join(OUTPUT_DIR, _report_filename(account, TODAY))
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(html_doc)
