@@ -43,6 +43,7 @@ TODAY = date.today()
 BENCHMARK_TICKER = "0P0000TKZO"   # Vanguard LifeStrategy 100% Equity A Acc (global equity proxy)
 BENCHMARK_LABEL  = "VLS100 TWR %"  # column header shown in the report
 ANN_MIN_DAYS = 365  # only show annualised figures when the window is at least this long
+RECENTLY_CLOSED_DAYS = 90  # show a sold-out position for this long after its last SELL
 
 
 # ---------- helpers ----------
@@ -300,6 +301,11 @@ def state_on(stock: Stock, as_of: date):
     return units, cost_basis, close, market_value
 
 
+def last_sell_date(stock: Stock) -> date | None:
+    sell_dates = [a.activity_date for a in stock.activities if a.kind == "SELL"]
+    return max(sell_dates) if sell_dates else None
+
+
 def period_flows(stock: Stock, start: date, end: date):
     """Cash flows in (start, end]. start is the opening-snapshot day; exclude it."""
     buys = sells = dividends = Decimal(0)
@@ -424,7 +430,9 @@ def portfolio_twr(stocks: list[Stock], start: date, end: date) -> Decimal | None
             if start <= activity.activity_date <= end:
                 activities_by_day.setdefault(activity.activity_date, []).append((stock, activity))
 
-    units_by_ticker = {stock.ticker: state_on(stock, previous_day)[0] for stock in stocks}
+    # Keyed by object identity, not ticker: the same ticker can appear as a
+    # separate Stock instance in multiple accounts when rolling up the whole portfolio.
+    units_by_stock = {id(stock): state_on(stock, previous_day)[0] for stock in stocks}
 
     chain = Decimal(1)
     contributed = False
@@ -432,7 +440,7 @@ def portfolio_twr(stocks: list[Stock], start: date, end: date) -> Decimal | None
     def portfolio_market_value_on(day: date) -> Decimal:
         total = Decimal(0)
         for stock in stocks:
-            units = units_by_ticker[stock.ticker]
+            units = units_by_stock[id(stock)]
             if units == 0:
                 continue
             price = _walk_back(stock.quotes_gbp, day, 30)
@@ -448,10 +456,10 @@ def portfolio_twr(stocks: list[Stock], start: date, end: date) -> Decimal | None
         for stock, activity in activities_by_day.get(day, []):
             if activity.kind == "BUY":
                 flow += activity.amount
-                units_by_ticker[stock.ticker] += activity.quantity
+                units_by_stock[id(stock)] += activity.quantity
             elif activity.kind == "SELL":
                 flow -= activity.amount
-                units_by_ticker[stock.ticker] -= activity.quantity
+                units_by_stock[id(stock)] -= activity.quantity
             elif activity.kind == "DIVIDEND":
                 flow -= activity.amount
 
@@ -472,6 +480,31 @@ def portfolio_twr(stocks: list[Stock], start: date, end: date) -> Decimal | None
 
 PERIOD_COLS = ["Period", "Window", "Start Valuation", "End Valuation", "Buy", "Sell",
                "Growth", "Dividend", "Total Return", "Simple %", "TWR %", "Yield %"]
+
+OVERVIEW_LABEL = "Overview"
+
+NAV_CSS = """
+nav.report-nav { margin: 4px 0 16px; font-size: 0.92em; }
+nav.report-nav a { color: #336; text-decoration: none; margin-right: 14px; }
+nav.report-nav a:hover { text-decoration: underline; }
+nav.report-nav a.current { color: #222; font-weight: bold; text-decoration: none; cursor: default; }
+"""
+
+
+def _report_filename(label: str, today: date) -> str:
+    return f"{today.strftime('%Y%m%d')}-{label}-report.html"
+
+
+def _nav_html(labels: list[str], current: str, today: date) -> str:
+    """Build the cross-page nav bar linking Overview + every account report.
+    `current` is highlighted rather than linked."""
+    links = []
+    for label in labels:
+        if label == current:
+            links.append(f"<a class='current'>{html.escape(label)}</a>")
+        else:
+            links.append(f"<a href='{_report_filename(label, today)}'>{html.escape(label)}</a>")
+    return f"<nav class='report-nav'>{''.join(links)}</nav>"
 
 
 def _fmt_money_html(value) -> str:
@@ -500,28 +533,26 @@ def _period_row_data(stocks_or_stock, period):
 
     market_value_start = market_value_end = Decimal(0)
     buys = sells_total = dividends_total = Decimal(0)
-    any_units = False
-    market_value_start_known = market_value_end_known = False
+    stocks_missing_price: set[str] = set()
 
     for stock in stocks:
         units_start, _, _, mv_start = state_on(stock, period_start - timedelta(days=1))
         units_end, _, _, mv_end = state_on(stock, period_end)
         _, period_buys, period_sells, period_dividends, _ = period_flows(stock, period_start - timedelta(days=1), period_end)
-        if units_start > 0 or units_end > 0 or period_buys > 0 or period_sells > 0:
-            any_units = True
+        if (units_start > 0 and mv_start.is_nan()) or (units_end > 0 and mv_end.is_nan()):
+            stocks_missing_price.add(stock.ticker)
         if not mv_start.is_nan():
             market_value_start += mv_start
-            if units_start > 0:
-                market_value_start_known = True
         if not mv_end.is_nan():
             market_value_end += mv_end
-            if units_end > 0:
-                market_value_end_known = True
         buys += period_buys
         sells_total += period_sells
         dividends_total += period_dividends
 
-    no_price = any_units and not market_value_start_known and not market_value_end_known
+    # Single-stock rows: any gap means we can't show that stock's valuation at all.
+    # Multi-stock (portfolio) rows: show the sum of what IS known, with a footnote
+    # listing which tickers are excluded, rather than blanking the whole total.
+    no_price = bool(stocks_missing_price) if is_single else False
 
     growth = (market_value_end - market_value_start) - (buys - sells_total)
     total_return = growth + dividends_total
@@ -541,6 +572,7 @@ def _period_row_data(stocks_or_stock, period):
         "simple_pct": simple_pct, "twr_pct": twr_pct,
         "yield_pct": yield_pct,
         "partial": False, "no_price": no_price, "show_yield": False,
+        "stocks_missing_price": stocks_missing_price if not is_single else set(),
     }
 
 
@@ -570,10 +602,16 @@ def _period_table_html(title: str | None, rows: list[dict], show_div_col: bool, 
     header_cells_html = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
     body = []
     blank = "<td class='num'>&nbsp;</td>"
+    missing_tickers_seen: list[str] = []
     for row in rows:
         start_class = " class='partial-start'" if row.get("partial") else ""
         window_cell = f"<td><span{start_class}>{row['start']}</span> &rarr; {row['end']}</td>"
         label_cell = f"<td>{html.escape(row['label'])}</td>"
+        missing = row.get("stocks_missing_price") or set()
+        gap_marker = "*" if missing else ""
+        for ticker in missing:
+            if ticker not in missing_tickers_seen:
+                missing_tickers_seen.append(ticker)
 
         if row.get("no_price"):
             cells = [
@@ -593,8 +631,8 @@ def _period_table_html(title: str | None, rows: list[dict], show_div_col: bool, 
             cells = [
                 label_cell,
                 window_cell,
-                f"<td class='num'>{_fmt_money_html(row['market_value_start'])}</td>",
-                f"<td class='num'>{_fmt_money_html(row['market_value_end'])}</td>",
+                f"<td class='num'>{_fmt_money_html(row['market_value_start'])}{gap_marker}</td>",
+                f"<td class='num'>{_fmt_money_html(row['market_value_end'])}{gap_marker}</td>",
                 f"<td class='num'>{_fmt_money_html(row['buys'])}</td>",
                 f"<td class='num'>{_fmt_money_html(row['sells'])}</td>",
                 f"<td class='num'>{_fmt_money_html(row['growth'])}</td>",
@@ -610,10 +648,16 @@ def _period_table_html(title: str | None, rows: list[dict], show_div_col: bool, 
                 cells.append(f"<td class='num'>{_fmt_pct_html(row['yield_pct']) if row.get('show_yield') else '&nbsp;'}</td>")
         body.append("<tr>" + "".join(cells) + "</tr>")
     heading = f"<h3>{html.escape(title)}</h3>" if title else ""
+    footnote = (
+        f"<p class='price-gap-note'>* excludes {html.escape(', '.join(missing_tickers_seen))} "
+        f"(no price data for that date)</p>"
+        if missing_tickers_seen else ""
+    )
     return (
         f"{heading}"
         f"<table class='periods'><thead><tr>{header_cells_html}</tr></thead>"
         f"<tbody>{''.join(body)}</tbody></table>"
+        f"{footnote}"
     )
 
 
@@ -710,10 +754,11 @@ def _stock_summary_row_html(simple_pct: Decimal | None, twr_pct: Decimal | None,
     return "<p class='stock-summary'>" + " &nbsp;|&nbsp; ".join(parts) + "</p>"
 
 
-def build_account_html(account: str, held_stocks: list[Stock],
-                       all_stocks: list[Stock],
-                       common_periods, today: date) -> str:
-    # portfolio block uses ALL stocks ever held (so sold-out positions contribute)
+def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods, today: date) -> str:
+    """Build the aggregate 'portfolio total' block (heading + summary + period table)
+    for a set of stocks. Used both for a single account's total and for the
+    cross-account overview total."""
+    # uses ALL stocks ever held (so sold-out positions contribute)
     earliest_activity = min(
         min((a.activity_date for a in stock.activities if a.kind in ("BUY", "SELL")), default=today)
         for stock in all_stocks
@@ -756,13 +801,74 @@ def build_account_html(account: str, held_stocks: list[Stock],
         annualised_yield=portfolio_annualised_yield,
     )
 
-    portfolio_html = (
-        f"<h2>{html.escape(account)} Account Total</h2>"
+    return (
+        f"<h2>{html.escape(heading)}</h2>"
         + portfolio_summary_row_html
         + _period_table_html(None, portfolio_rows, portfolio_has_dividends, portfolio_has_yield)
     )
 
-    # per-stock blocks — currently held only, sorted by current market value descending
+
+def _stock_block_html(stock: Stock, activities_div_id: str, common_periods, today: date,
+                      weight_pct: Decimal | None, closed_on: date | None) -> str:
+    """Build one <section class='stock'> block: heading, summary row, period table, activities toggle."""
+    num_common_periods = len(common_periods)
+    ytd_index = num_common_periods - 1  # YTD is last of common_periods
+
+    inception = min((a.activity_date for a in stock.activities if a.kind in ("BUY", "SELL")), default=today)
+    prior_years = _prior_year_periods(inception, today)
+    stock_periods = common_periods + prior_years + [("Since inception", inception, today)]
+    rows = [_period_row_data(stock, period) for period in stock_periods]
+    num_prior_years_stock = len(prior_years)
+    for row, (_, period_start, _) in zip(rows[num_common_periods:num_common_periods + num_prior_years_stock], prior_years):
+        if period_start != date(period_start.year, 1, 1):
+            row["partial"] = True
+
+    # show yield on YTD and prior years; NOT on "Since inception" (misleading against initial cost)
+    for row in rows[ytd_index:ytd_index + 1]:
+        row["show_yield"] = True
+    for row in rows[num_common_periods:num_common_periods + num_prior_years_stock]:  # prior years only, not since-inception
+        row["show_yield"] = True
+
+    stock_has_dividends = any(row["dividends"] != 0 for row in rows)
+    stock_has_yield = any(row["yield_pct"] is not None for row in rows)
+
+    inception_row = rows[-1]
+
+    # annualised yield from the since-inception window (only meaningful for dividend stocks)
+    inception_yield_pct = inception_row["yield_pct"]
+    annualised_yield = annualise(
+        Decimal(str(inception_yield_pct)) / 100 if inception_yield_pct is not None else None,
+        inception, today,
+    )
+
+    summary_row_html = _stock_summary_row_html(
+        inception_row["simple_pct"],
+        inception_row["twr_pct"],
+        inception, today,
+        weight_pct,
+        is_dividend_stock=stock_has_dividends,
+        annualised_yield=annualised_yield,
+    )
+
+    closed_note = f"&nbsp;<span class='closed-note'>(closed on {closed_on.strftime('%d/%m/%Y')})</span>" if closed_on else ""
+
+    return (
+        f"<section class='stock'>"
+        f"<h2>{html.escape(stock.name)}&nbsp;[{html.escape(stock.ticker)}]{closed_note}</h2>"
+        f"{summary_row_html}"
+        f"{_period_table_html(None, rows, stock_has_dividends, stock_has_yield)}"
+        f"<p class='activities-toggle'><a href='#' class='toggle' data-target='{activities_div_id}'>show activities &gt;</a></p>"
+        f"<div id='{activities_div_id}' class='activities-wrap' style='display:none;'>{_activities_table_html(stock)}</div>"
+        f"</section>"
+    )
+
+
+def build_account_html(account: str, held_stocks: list[Stock],
+                       all_stocks: list[Stock],
+                       common_periods, today: date, nav_html: str = "") -> str:
+    portfolio_html = _portfolio_block_html(f"{account} Account Total", all_stocks, common_periods, today)
+
+    # per-stock blocks — currently held, sorted by current market value descending
     def _current_market_value(stock: Stock) -> Decimal:
         market_value = state_on(stock, today)[3]
         return Decimal(0) if market_value.is_nan() else market_value
@@ -772,58 +878,29 @@ def build_account_html(account: str, held_stocks: list[Stock],
 
     stock_blocks = []
     for stock_index, stock in enumerate(held_stocks_sorted):
-        inception = min((a.activity_date for a in stock.activities if a.kind in ("BUY", "SELL")), default=today)
-        prior_years = _prior_year_periods(inception, today)
-        stock_periods = common_periods + prior_years + [("Since inception", inception, today)]
-        rows = [_period_row_data(stock, period) for period in stock_periods]
-        num_prior_years_stock = len(prior_years)
-        for row, (_, period_start, _) in zip(rows[num_common_periods:num_common_periods + num_prior_years_stock], prior_years):
-            if period_start != date(period_start.year, 1, 1):
-                row["partial"] = True
-
-        # show yield on YTD and prior years; NOT on "Since inception" (misleading against initial cost)
-        for row in rows[ytd_index:ytd_index + 1]:
-            row["show_yield"] = True
-        for row in rows[num_common_periods:num_common_periods + num_prior_years_stock]:  # prior years only, not since-inception
-            row["show_yield"] = True
-
-        stock_has_dividends = any(row["dividends"] != 0 for row in rows)
-        stock_has_yield = any(row["yield_pct"] is not None for row in rows)
-
-        activities_div_id = f"acts-{stock_index}"
-
-        inception_row = rows[-1]
-
-        # compute current weight within the portfolio
         stock_market_value = _current_market_value(stock)
         weight_pct = (stock_market_value / portfolio_total_market_value * 100
                       if portfolio_total_market_value > 0 else None)
+        stock_blocks.append(_stock_block_html(
+            stock, f"acts-{stock_index}", common_periods, today, weight_pct, closed_on=None,
+        ))
 
-        # annualised yield from the since-inception window (only meaningful for dividend stocks)
-        inception_yield_pct = inception_row["yield_pct"]
-        annualised_yield = annualise(
-            Decimal(str(inception_yield_pct)) / 100 if inception_yield_pct is not None else None,
-            inception, today,
-        )
+    # recently-closed positions: sold out entirely, but within RECENTLY_CLOSED_DAYS of today
+    closed_stocks = [stock for stock in all_stocks if stock not in held_stocks]
+    closed_with_dates = [(stock, last_sell_date(stock)) for stock in closed_stocks]
+    recently_closed = sorted(
+        (pair for pair in closed_with_dates
+         if pair[1] is not None and (today - pair[1]).days <= RECENTLY_CLOSED_DAYS),
+        key=lambda pair: pair[1], reverse=True,
+    )
 
-        summary_row_html = _stock_summary_row_html(
-            inception_row["simple_pct"],
-            inception_row["twr_pct"],
-            inception, today,
-            weight_pct,
-            is_dividend_stock=stock_has_dividends,
-            annualised_yield=annualised_yield,
-        )
-
-        stock_blocks.append(
-            f"<section class='stock'>"
-            f"<h2>{html.escape(stock.name)}&nbsp;[{html.escape(stock.ticker)}]</h2>"
-            f"{summary_row_html}"
-            f"{_period_table_html(None, rows, stock_has_dividends, stock_has_yield)}"
-            f"<p class='activities-toggle'><a href='#' class='toggle' data-target='{activities_div_id}'>show activities &gt;</a></p>"
-            f"<div id='{activities_div_id}' class='activities-wrap' style='display:none;'>{_activities_table_html(stock)}</div>"
-            f"</section>"
-        )
+    closed_blocks = []
+    if recently_closed:
+        closed_blocks.append("<h3 class='closed-heading'>Recently closed</h3>")
+        for stock_index, (stock, closed_on) in enumerate(recently_closed):
+            closed_blocks.append(_stock_block_html(
+                stock, f"acts-closed-{stock_index}", common_periods, today, weight_pct=None, closed_on=closed_on,
+            ))
 
     css = """
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #222; }
@@ -845,7 +922,10 @@ def build_account_html(account: str, held_stocks: list[Stock],
     .partial-start { font-weight: bold; }
     .no-price { color: #888; font-style: italic; text-align: center !important; }
     p.stock-summary { margin: 2px 0 0; font-size: 0.88em; color: #555; padding-bottom: 6px; border-bottom: 2px solid #444; }
-    """
+    h3.closed-heading { margin-top: 32px; border-bottom: 2px solid #444; padding-bottom: 4px; }
+    span.closed-note { font-size: 0.7em; font-weight: normal; color: #888; }
+    p.price-gap-note { margin: -12px 0 20px; font-size: 0.82em; color: #888; }
+    """ + NAV_CSS
     js = """
     document.querySelectorAll('a.toggle').forEach(function(link) {
       link.addEventListener('click', function(e) {
@@ -863,9 +943,45 @@ def build_account_html(account: str, held_stocks: list[Stock],
 <style>{css}</style>
 </head><body>
 <h1>{html.escape(account)} Return Report Generated {today.isoformat()}</h1>
+{nav_html}
 <section class='portfolio'>{portfolio_html}</section>
 {''.join(stock_blocks)}
+{''.join(closed_blocks)}
 <script>{js}</script>
+</body></html>"""
+
+
+def build_overview_html(all_stocks: list[Stock], common_periods, today: date, nav_html: str) -> str:
+    """Whole-portfolio view combining stocks from every account, using the same
+    timebands/columns as an account's portfolio-total block."""
+    portfolio_html = _portfolio_block_html("Portfolio Total", all_stocks, common_periods, today)
+
+    css = """
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #222; }
+    h1 { margin-bottom: 4px; }
+    h2 { margin-top: 32px; margin-bottom: 0; }
+    h3 { margin-top: 20px; font-size: 1em; }
+    table { border-collapse: collapse; margin: 8px 0 20px; font-size: 0.88em; }
+    th, td { padding: 4px 10px; border-bottom: 1px solid #eee; text-align: left; }
+    th { background: #f4f4f4; border-bottom: 2px solid #ccc; }
+    tbody tr:nth-child(even) { background: #f2f5fb; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .neg { color: #c0392b; }
+    .portfolio { background: #e8f0ff; padding: 12px 16px; border: 1px solid #88a; border-radius: 4px; }
+    .portfolio h2 { margin-top: 0; }
+    .partial-start { font-weight: bold; }
+    .no-price { color: #888; font-style: italic; text-align: center !important; }
+    p.stock-summary { margin: 2px 0 0; font-size: 0.88em; color: #555; padding-bottom: 6px; border-bottom: 2px solid #444; }
+    p.price-gap-note { margin: -12px 0 20px; font-size: 0.82em; color: #888; }
+    """ + NAV_CSS
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'>
+<title>{html.escape(OVERVIEW_LABEL)}</title>
+<style>{css}</style>
+</head><body>
+<h1>{html.escape(OVERVIEW_LABEL)} Return Report Generated {today.isoformat()}</h1>
+{nav_html}
+<section class='portfolio'>{portfolio_html}</section>
 </body></html>"""
 
 
@@ -897,6 +1013,9 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Pass 1: load every account's stocks once, keep the in-memory data for
+    # both the account page and the combined overview (no re-querying the DB).
+    loaded_accounts = []  # list of (account, held_stocks, all_stocks)
     for account in accounts:
         all_stocks, _ = load_all(TICKERS, account)
         all_stocks = [stock for stock in all_stocks if stock.activities]
@@ -904,10 +1023,25 @@ def main():
         if not held_stocks:
             print(f"{account}: no currently-held tickers, skipping")
             continue
+        loaded_accounts.append((account, held_stocks, all_stocks))
 
-        html_doc = build_account_html(account, held_stocks, all_stocks, common_periods, TODAY)
-        filename = f"{TODAY.strftime('%Y%m%d')}-{account}-report.html"
-        filepath = os.path.join(OUTPUT_DIR, filename)
+    nav_labels = [OVERVIEW_LABEL] + [account for account, _, _ in loaded_accounts]
+
+    # Pass 2: write the overview page, combining stocks across all accounts.
+    overview_all_stocks = [stock for _, _, all_stocks in loaded_accounts for stock in all_stocks]
+    if overview_all_stocks:
+        overview_nav_html = _nav_html(nav_labels, OVERVIEW_LABEL, TODAY)
+        overview_doc = build_overview_html(overview_all_stocks, common_periods, TODAY, overview_nav_html)
+        overview_filepath = os.path.join(OUTPUT_DIR, _report_filename(OVERVIEW_LABEL, TODAY))
+        with open(overview_filepath, "w", encoding="utf-8") as f:
+            f.write(overview_doc)
+        print(f"Wrote {overview_filepath}  ({len(loaded_accounts)} accounts combined)")
+
+    # Pass 3: write each account page with nav links to the overview + every other account.
+    for account, held_stocks, all_stocks in loaded_accounts:
+        nav_html = _nav_html(nav_labels, account, TODAY)
+        html_doc = build_account_html(account, held_stocks, all_stocks, common_periods, TODAY, nav_html)
+        filepath = os.path.join(OUTPUT_DIR, _report_filename(account, TODAY))
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(html_doc)
         sold_tickers = [stock.ticker for stock in all_stocks if stock not in held_stocks]
