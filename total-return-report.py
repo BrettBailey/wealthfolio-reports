@@ -31,19 +31,19 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-DB_PATH = os.path.join(os.environ["APPDATA"], "com.teymz.wealthfolio", "app.db")
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+from config import (
+    ACCOUNTS,
+    ANN_MIN_DAYS,
+    BENCHMARK_LABEL,
+    BENCHMARK_TICKER,
+    DB_PATH,
+    OUTPUT_DIR,
+    RECENTLY_CLOSED_DAYS,
+    THEMES,
+    TICKERS,
+)
 
-ACCOUNTS: list[str] | None = None   # list of account names; None = auto-discover all accounts in DB
-TICKERS: list[str] | None = None    # list of tickers; None = auto-discover all currently-held tickers per account
 TODAY = date.today()
-
-# Benchmark used for comparison columns.  Must be a display_code present in the DB with
-# sufficient quote history.  The TWR is computed price-only (no cash flows).
-BENCHMARK_TICKER = "0P0000TKZO"   # Vanguard LifeStrategy 100% Equity A Acc (global equity proxy)
-BENCHMARK_LABEL  = "VLS100 TWR %"  # column header shown in the report
-ANN_MIN_DAYS = 365  # only show annualised figures when the window is at least this long
-RECENTLY_CLOSED_DAYS = 90  # show a sold-out position for this long after its last SELL
 
 
 # ---------- helpers ----------
@@ -754,10 +754,11 @@ def _stock_summary_row_html(simple_pct: Decimal | None, twr_pct: Decimal | None,
     return "<p class='stock-summary'>" + " &nbsp;|&nbsp; ".join(parts) + "</p>"
 
 
-def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods, today: date) -> str:
+def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods, today: date,
+                          weight_pct: Decimal | None = None) -> str:
     """Build the aggregate 'portfolio total' block (heading + summary + period table)
-    for a set of stocks. Used both for a single account's total and for the
-    cross-account overview total."""
+    for a set of stocks. Used for a single account's total, the cross-account
+    overview total, and theme blocks (which pass their combined weight_pct)."""
     # uses ALL stocks ever held (so sold-out positions contribute)
     earliest_activity = min(
         min((a.activity_date for a in stock.activities if a.kind in ("BUY", "SELL")), default=today)
@@ -796,7 +797,7 @@ def _portfolio_block_html(heading: str, all_stocks: list[Stock], common_periods,
         portfolio_inception_row["simple_pct"],
         portfolio_inception_row["twr_pct"],
         earliest_activity, today,
-        weight_pct=None,  # weight not applicable at portfolio level
+        weight_pct=weight_pct,  # None at portfolio level; combined weight for a theme block
         is_dividend_stock=portfolio_has_dividends,
         annualised_yield=portfolio_annualised_yield,
     )
@@ -863,6 +864,35 @@ def _stock_block_html(stock: Stock, activities_div_id: str, common_periods, toda
     )
 
 
+def _theme_blocks_html(account: str, all_stocks: list[Stock], common_periods, today: date,
+                       current_market_value, portfolio_total_market_value: Decimal) -> str:
+    """Build one block per theme configured for this account (THEMES in config.py),
+    each an aggregate return block (like the account total) for its member tickers,
+    with a combined portfolio weight in the summary line."""
+    account_themes = THEMES.get(account)
+    if not account_themes:
+        return ""
+
+    stocks_by_ticker = {stock.ticker: stock for stock in all_stocks}
+    blocks = []
+    for theme_name, tickers in account_themes.items():
+        theme_stocks = [stocks_by_ticker[ticker] for ticker in tickers if ticker in stocks_by_ticker]
+        missing = [ticker for ticker in tickers if ticker not in stocks_by_ticker]
+        if missing:
+            print(f"{account}: theme {theme_name!r} references unknown ticker(s): {', '.join(missing)}")
+        if not theme_stocks:
+            continue
+
+        theme_market_value = sum(current_market_value(stock) for stock in theme_stocks)
+        weight_pct = (theme_market_value / portfolio_total_market_value * 100
+                      if portfolio_total_market_value > 0 else None)
+        theme_html = _portfolio_block_html(
+            f"{theme_name} Theme", theme_stocks, common_periods, today, weight_pct=weight_pct,
+        )
+        blocks.append(f"<section class='theme'>{theme_html}</section>")
+    return "".join(blocks)
+
+
 def build_account_html(account: str, held_stocks: list[Stock],
                        all_stocks: list[Stock],
                        common_periods, today: date, nav_html: str = "") -> str:
@@ -875,6 +905,10 @@ def build_account_html(account: str, held_stocks: list[Stock],
 
     portfolio_total_market_value = sum(_current_market_value(stock) for stock in held_stocks)
     held_stocks_sorted = sorted(held_stocks, key=_current_market_value, reverse=True)
+
+    theme_blocks_html = _theme_blocks_html(
+        account, all_stocks, common_periods, today, _current_market_value, portfolio_total_market_value,
+    )
 
     stock_blocks = []
     for stock_index, stock in enumerate(held_stocks_sorted):
@@ -919,6 +953,8 @@ def build_account_html(account: str, held_stocks: list[Stock],
     p.activities-toggle { margin: 4px 0 12px; }
     .portfolio { background: #e8f0ff; padding: 12px 16px; border: 1px solid #88a; border-radius: 4px; }
     .portfolio h2 { margin-top: 0; }
+    section.theme { background: #f2ede0; padding: 12px 16px; border: 1px solid #a99; border-radius: 4px; margin-top: 20px; }
+    section.theme h2 { margin-top: 0; }
     .partial-start { font-weight: bold; }
     .no-price { color: #888; font-style: italic; text-align: center !important; }
     p.stock-summary { margin: 2px 0 0; font-size: 0.88em; color: #555; padding-bottom: 6px; border-bottom: 2px solid #444; }
@@ -945,6 +981,7 @@ def build_account_html(account: str, held_stocks: list[Stock],
 <h1>{html.escape(account)} Return Report Generated {today.isoformat()}</h1>
 {nav_html}
 <section class='portfolio'>{portfolio_html}</section>
+{theme_blocks_html}
 {''.join(stock_blocks)}
 {''.join(closed_blocks)}
 <script>{js}</script>
